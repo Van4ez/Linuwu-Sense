@@ -4157,11 +4157,18 @@ enum acer_wmi_predator_v4_oc {
      current_kb_state.green = out.gmOutput[6];
      current_kb_state.blue = out.gmOutput[7];
  
-     // Get per-zone color data
-     status = get_per_zone_color(&current_kb_state.zones);
-     if (ACPI_FAILURE(status)) {
-         pr_err("get_per_zone_color failed!");
-         return -1;
+     /*
+      * On HID models WMI does not reflect the backlight state and returns
+      * junk, clobbering the cache kept by set_per_zone_color(). The zones
+      * there are already accurate: restored from the state file or set
+      * through sysfs.
+      */
+     if (!(quirks && quirks->nitro_hid_kb)) {
+         status = get_per_zone_color(&current_kb_state.zones);
+         if (ACPI_FAILURE(status)) {
+             pr_err("get_per_zone_color failed!");
+             return -1;
+         }
      }
      return 0;
  }
