@@ -3654,30 +3654,67 @@ enum acer_wmi_predator_v4_oc {
  #define ACER_HID_RGB_VID        0x0CF2
  #define ACER_HID_RGB_PID        0x5130
  #define ACER_HID_RGB_REPORT_ID  0xA4
- #define ACER_HID_KB_TARGET      0x15
+ #define ACER_HID_RGB_REPORT_LEN 20
+ #define ACER_HID_KB_TARGET      0x21
  #define ACER_HID_LOGO_TARGET    0x53
+
+ /*
+  * HID mode codes differ from the sysfs numbering, which mirrors WMI, so
+  * the sysfs value must be translated, never passed through as-is.
+  */
+ #define ACER_HID_MODE_STATIC    0x02
+ #define ACER_HID_MODE_BREATHING 0x04
+ #define ACER_HID_MODE_NEON      0x05
+ #define ACER_HID_MODE_WAVE      0x07
 
  static struct hid_device *acer_hid_rgb_dev = NULL;
 
- static int acer_hid_set_kb_feature(u8 target, u8 mode, u8 brightness,
-                                     u8 speed, u8 direction,
-                                     u8 r, u8 g, u8 b, u16 zone)
+ /* sysfs/WMI mode -> HID mode; negative means the protocol has no such mode */
+ static int acer_hid_map_mode(int wmi_mode)
  {
-     u8 buf[11];
+     switch (wmi_mode) {
+     case 0: return ACER_HID_MODE_STATIC;
+     case 1: return ACER_HID_MODE_BREATHING;
+     case 2: return ACER_HID_MODE_NEON;
+     case 3: return ACER_HID_MODE_WAVE;
+     default: return -EOPNOTSUPP;
+     }
+ }
+
+ /*
+  * The controller only accepts this command as a 20-byte SET_FEATURE report.
+  * An output report of the same length is silently ignored, which is why
+  * writes appeared to succeed while the backlight never changed.
+  */
+ static int acer_hid_set_kb_feature(u8 target, u8 hid_mode, u8 brightness,
+                                     u8 r, u8 g, u8 b, u8 zone)
+ {
+     u8 *buf;
+     int ret;
+
      if (!acer_hid_rgb_dev)
          return -ENODEV;
-     buf[0]  = ACER_HID_RGB_REPORT_ID;
-     buf[1]  = target;
-     buf[2]  = mode;
-     buf[3]  = brightness;
-     buf[4]  = speed;
-     buf[5]  = direction;
-     buf[6]  = r;
-     buf[7]  = g;
-     buf[8]  = b;
-     buf[9]  = zone & 0xFF;
-     buf[10] = (zone >> 8) & 0xFF;
-     return hid_hw_output_report(acer_hid_rgb_dev, buf, sizeof(buf));
+
+     /* hid_hw_raw_request() needs a DMA-capable buffer, so no stack storage */
+     buf = kzalloc(ACER_HID_RGB_REPORT_LEN, GFP_KERNEL);
+     if (!buf)
+         return -ENOMEM;
+
+     buf[0] = ACER_HID_RGB_REPORT_ID;
+     buf[1] = target;
+     buf[2] = hid_mode;
+     buf[3] = brightness;
+     /* bytes 4-5 are always zero in this protocol */
+     buf[6] = r;
+     buf[7] = g;
+     buf[8] = b;
+     buf[9] = zone;
+
+     ret = hid_hw_raw_request(acer_hid_rgb_dev, buf[0], buf,
+                              ACER_HID_RGB_REPORT_LEN,
+                              HID_FEATURE_REPORT, HID_REQ_SET_REPORT);
+     kfree(buf);
+     return ret;
  }
 
  static int acer_hid_rgb_probe(struct hid_device *hdev,
@@ -3732,11 +3769,18 @@ enum acer_wmi_predator_v4_oc {
                                   int direction, int red, int green, int blue){
      /* Use HID path on models where WMI silently ignores RGB commands */
      if (quirks && quirks->nitro_hid_kb && acer_hid_rgb_dev) {
-         int ret = acer_hid_set_kb_feature(ACER_HID_KB_TARGET,
-                                            (u8)mode, (u8)brightness,
-                                            (u8)speed, (u8)direction,
-                                            (u8)red, (u8)green, (u8)blue,
-                                            0x000F);
+         int hid_mode = acer_hid_map_mode(mode);
+         int ret;
+
+         if (hid_mode < 0) {
+             pr_err("KB mode %d has no HID equivalent on this model\n", mode);
+             return AE_SUPPORT;
+         }
+         /* speed and direction are not carried by the HID protocol */
+         ret = acer_hid_set_kb_feature(ACER_HID_KB_TARGET, (u8)hid_mode,
+                                        (u8)brightness,
+                                        (u8)red, (u8)green, (u8)blue,
+                                        0x0F);
          return (ret >= 0) ? AE_OK : AE_ERROR;
      }
 
@@ -3988,15 +4032,22 @@ enum acer_wmi_predator_v4_oc {
              u8 r = (color >> 16) & 0xFF;
              u8 g = (color >> 8) & 0xFF;
              u8 b = color & 0xFF;
-             int ret = acer_hid_set_kb_feature(ACER_HID_KB_TARGET, 0x00,
+             int ret = acer_hid_set_kb_feature(ACER_HID_KB_TARGET,
+                                                ACER_HID_MODE_STATIC,
                                                 (u8)input->brightness,
-                                                0, 0, r, g, b, zone_ids[i]);
+                                                r, g, b, zone_ids[i]);
              if (ret < 0) {
                  pr_err("HID error setting KB color (zone %d)\n", i + 1);
                  return AE_ERROR;
              }
          }
          current_kb_state.per_zone = 1;
+         /*
+          * State is read back over WMI, which knows nothing about the HID backlight
+          * on this model and returns junk. Remember what was set so that show()
+          * can report the truth.
+          */
+         current_kb_state.zones = *input;
          return AE_OK;
      }
 
@@ -4024,6 +4075,15 @@ enum acer_wmi_predator_v4_oc {
  static ssize_t per_zoned_rgb_kb_show(struct device *dev, struct device_attribute *attr,char *buf){
      struct per_zone_color output;
      acpi_status status;
+
+     /* WMI does not reflect reality on HID models, so report the cached value */
+     if (quirks && quirks->nitro_hid_kb && acer_hid_rgb_dev) {
+         output = current_kb_state.zones;
+         return sprintf(buf,"%06llx,%06llx,%06llx,%06llx,%d\n",
+                        output.zone1, output.zone2, output.zone3, output.zone4,
+                        output.brightness);
+     }
+
      status = get_per_zone_color(&output);
      if(ACPI_FAILURE(status)){
          return -ENODEV;
