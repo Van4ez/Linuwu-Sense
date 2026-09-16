@@ -3667,7 +3667,36 @@ enum acer_wmi_predator_v4_oc {
  #define ACER_HID_MODE_NEON      0x05
  #define ACER_HID_MODE_WAVE      0x07
 
+ /* KB Backlight State  */;
+ 
+ struct per_zone_color {
+     u64 zone1, zone2, zone3, zone4;
+     int brightness;
+ } __packed;
+ 
+ struct kb_state {
+     u8 per_zone;
+     u8 mode;
+     u8 speed;
+     u8 brightness;
+     u8 direction;
+     u8 red;
+     u8 green;
+     u8 blue;
+     struct per_zone_color zones;
+ } __packed;
+ 
+ static struct kb_state current_kb_state;
+ 
  static struct hid_device *acer_hid_rgb_dev = NULL;
+
+ /*
+  * On HID models the saved keyboard state is read from disk in the platform
+  * probe, which runs before the HID driver is even registered. The restore
+  * is therefore deferred until acer_hid_rgb_probe() has a device to talk to.
+  */
+ static bool kb_state_pending;
+ static int four_zone_kb_state_apply(void);
 
  /* sysfs/WMI mode -> HID mode; negative means the protocol has no such mode */
  static int acer_hid_map_mode(int wmi_mode)
@@ -3734,6 +3763,10 @@ enum acer_wmi_predator_v4_oc {
      }
      acer_hid_rgb_dev = hdev;
      pr_info("Acer HID RGB keyboard controller found\n");
+     if (kb_state_pending) {
+         kb_state_pending = false;
+         four_zone_kb_state_apply();
+     }
      return 0;
  }
 
@@ -3781,7 +3814,17 @@ enum acer_wmi_predator_v4_oc {
                                         (u8)brightness,
                                         (u8)red, (u8)green, (u8)blue,
                                         0x0F);
-         return (ret >= 0) ? AE_OK : AE_ERROR;
+         if (ret < 0)
+             return AE_ERROR;
+         /* WMI cannot read this back on HID models, so keep our own copy */
+         current_kb_state.mode = mode;
+         current_kb_state.speed = speed;
+         current_kb_state.brightness = brightness;
+         current_kb_state.direction = direction;
+         current_kb_state.red = red;
+         current_kb_state.green = green;
+         current_kb_state.blue = blue;
+         return AE_OK;
      }
 
      u64 resp = 0;
@@ -3848,27 +3891,6 @@ enum acer_wmi_predator_v4_oc {
            return AE_ERROR;
  }
  
- 
- /* KB Backlight State  */;
- 
- struct per_zone_color {
-     u64 zone1, zone2, zone3, zone4;
-     int brightness;
- } __packed;
- 
- struct kb_state {
-     u8 per_zone;
-     u8 mode;
-     u8 speed;
-     u8 brightness;
-     u8 direction;
-     u8 red;
-     u8 green;
-     u8 blue;
-     struct per_zone_color zones;
- } __packed;
- 
- static struct kb_state current_kb_state;
  
  
  /* four zone mode */
@@ -4142,6 +4164,10 @@ enum acer_wmi_predator_v4_oc {
      acpi_status status;
      struct get_four_zoned_kb_output out;
  
+     /* HID models: WMI returns junk for every field, the cache is authoritative */
+     if (quirks && quirks->nitro_hid_kb)
+         return 0;
+ 
      // Get keyboard status
      status = get_kb_status(&out);
      if (ACPI_FAILURE(status)) {
@@ -4207,7 +4233,6 @@ enum acer_wmi_predator_v4_oc {
  {
      struct file *file;
      ssize_t len;
-     acpi_status status;
  
      file = filp_open(KB_STATE_FILE, O_RDONLY, 0);
      if (!IS_ERR(file)) {
@@ -4225,6 +4250,22 @@ enum acer_wmi_predator_v4_oc {
          pr_info("KB state file not found!\n");
          return -1;
      }
+ 
+     if (quirks && quirks->nitro_hid_kb && !acer_hid_rgb_dev) {
+         /* Going through WMI now would be a no-op on the keyboard and would
+          * also corrupt the cached zone colours in place. Wait for the HID
+          * controller instead. */
+         kb_state_pending = true;
+         pr_info("KB state restore deferred until HID controller is found\n");
+         return 0;
+     }
+ 
+     return four_zone_kb_state_apply();
+ }
+ 
+ static int four_zone_kb_state_apply(void)
+ {
+     acpi_status status;
  
      if(current_kb_state.per_zone){
          status = set_per_zone_color(&current_kb_state.zones);
