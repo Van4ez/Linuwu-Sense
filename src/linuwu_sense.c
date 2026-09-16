@@ -3698,6 +3698,15 @@ enum acer_wmi_predator_v4_oc {
  static bool kb_state_pending;
  static int four_zone_kb_state_apply(void);
 
+ /*
+  * A sysfs store runs with the writing user's credentials, so opening the
+  * root-owned state file from there fails with EACCES. A kernel worker runs
+  * with kernel credentials, and it also keeps the disk write out of the
+  * sysfs path.
+  */
+ static void kb_state_save_workfn(struct work_struct *work);
+ static DECLARE_WORK(kb_state_save_work, kb_state_save_workfn);
+
  /* sysfs/WMI mode -> HID mode; negative means the protocol has no such mode */
  static int acer_hid_map_mode(int wmi_mode)
  {
@@ -4008,6 +4017,7 @@ enum acer_wmi_predator_v4_oc {
  
      /* Set per_zone to 0 */
      current_kb_state.per_zone = 0;
+     schedule_work(&kb_state_save_work);
  
      return count;
  }
@@ -4155,6 +4165,7 @@ enum acer_wmi_predator_v4_oc {
          pr_err("Error setting RGB KB status.\n");
          return -ENODEV;
      }
+     schedule_work(&kb_state_save_work);
      return count;
  }
  
@@ -4206,9 +4217,9 @@ enum acer_wmi_predator_v4_oc {
      four_zone_kb_state_update();
  
      file = filp_open(KB_STATE_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-     if(!file) {
-         pr_err("kb_state_access - Error opening file\n");
-         return -1;
+     if (IS_ERR(file)) {
+         pr_err("kb_state_access - Error opening file: %ld\n", PTR_ERR(file));
+         return PTR_ERR(file);
      }
  
      len = kernel_write(file, (char *)&current_kb_state, sizeof(current_kb_state), &file->f_pos);
@@ -4226,6 +4237,11 @@ enum acer_wmi_predator_v4_oc {
  
      pr_info("kb states saved successfully\n");
      return 0;
+ }
+
+ static void kb_state_save_workfn(struct work_struct *work)
+ {
+     four_zone_kb_state_save();
  }
  
  
@@ -4401,6 +4417,7 @@ enum acer_wmi_predator_v4_oc {
      }
      if(quirks->four_zone_kb){
          sysfs_remove_group(&device->dev.kobj, &four_zoned_kb_attr_group);
+         cancel_work_sync(&kb_state_save_work);
          four_zone_kb_state_save();
      }
  
